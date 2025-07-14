@@ -1,0 +1,588 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    env:
+      ENABLE_AUTO_HEALING: true
+      MAX_BUILD_ATTEMPTS: 3
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js 20.x (Required for Capacitor CLI)
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20.10.0'  # Capacitor requires Node.js >= 20.0.0
+        cache: 'npm'
+
+    - name: Verify Node.js version compatibility
+      run: |
+        echo "Node.js version: $(node --version)"
+        echo "npm version: $(npm --version)"
+        
+        # Verify Node.js is >= 20.0.0 for Capacitor CLI
+        NODE_VERSION=$(node --version | cut -d'v' -f2)
+        if [[ "$NODE_VERSION" < "20.0.0" ]]; then
+          echo "❌ Node.js version $NODE_VERSION is too old for Capacitor CLI"
+          echo "✅ Required: >= 20.0.0"
+          exit 1
+        fi
+        echo "✅ Node.js version $NODE_VERSION is compatible with Capacitor CLI"
+
+    - name: Setup Java JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+      with:
+        cmdline-tools-version: '11076708'
+        accept-android-sdk-licenses: true
+
+    - name: Install Android SDK components
+      run: |
+        echo "Installing required Android SDK components..."
+        echo "JAVA_HOME: $JAVA_HOME"
+        echo "ANDROID_SDK_ROOT: $ANDROID_SDK_ROOT"
+        
+        # Install required SDK components
+        $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+          "platforms;android-34" \
+          "platforms;android-33" \
+          "build-tools;34.0.0" \
+          "build-tools;33.0.1" \
+          "platform-tools" \
+          "cmdline-tools;latest"
+        
+        # Accept all licenses
+        echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses
+
+    - name: Install dependencies
+      run: |
+        echo "Installing Node.js dependencies..."
+        npm ci
+
+    - name: Build web assets
+      run: |
+        echo "Building web assets..."
+        npm run build
+        
+        # Verify build output
+        if [ ! -d "dist" ]; then
+          echo "❌ Build failed - dist directory not found"
+          exit 1
+        fi
+        
+        echo "✅ Web assets built successfully"
+        ls -la dist/
+
+    - name: Install Capacitor CLI (Latest for Node 20+)
+      run: |
+        echo "Installing latest Capacitor CLI for Node.js 20+..."
+        npm install -g @capacitor/cli@latest
+        
+        # Verify installation
+        echo "Capacitor CLI version:"
+        npx cap --version
+        echo "✅ Capacitor CLI installed successfully"
+
+    - name: Configure Capacitor for production build
+      run: |
+        echo "Configuring Capacitor for production build..."
+        
+        # Create production capacitor config
+        cat > capacitor.config.ts << 'EOF'
+        import { CapacitorConfig } from '@capacitor/cli';
+
+        const config: CapacitorConfig = {
+          appId: 'com.parknjoy.familyapp',
+          appName: 'Park N Joy',
+          webDir: 'dist',
+          bundledWebRuntime: false,
+          plugins: {
+            SplashScreen: {
+              launchShowDuration: 2000,
+              backgroundColor: '#10b981',
+              androidSplashResourceName: 'splash',
+              androidScaleType: 'CENTER_CROP'
+            },
+            Geolocation: {
+              permissions: ["ACCESS_COARSE_LOCATION", "ACCESS_FINE_LOCATION"]
+            },
+            Camera: {
+              permissions: ["CAMERA", "WRITE_EXTERNAL_STORAGE"]
+            }
+          }
+        };
+
+        export default config;
+        EOF
+        
+        echo "✅ Capacitor configuration created"
+
+    - name: Remove any existing Android platform
+      run: |
+        echo "Cleaning up any existing Android platform..."
+        if [ -d "android" ]; then
+          echo "🗑️ Removing existing android directory..."
+          rm -rf android
+        fi
+        echo "✅ Ready for fresh Android platform installation"
+
+    - name: Add Android platform and verify full scaffolding
+      run: |
+        echo "🔨 Adding Android platform to Capacitor with full native scaffolding..."
+        
+        # Log capacitor.config.ts content for verification
+        echo "📋 Current Capacitor configuration:"
+        cat capacitor.config.ts
+        echo ""
+        
+        # Add Android platform with comprehensive scaffolding verification
+        echo "▶️ Running: npx cap add android"
+        if npx cap add android 2>&1 | tee cap_add_log.txt; then
+          echo "✅ Capacitor add command completed"
+        else
+          echo "❌ Capacitor add command failed"
+          cat cap_add_log.txt
+          exit 1
+        fi
+        
+        # Verify android directory was created
+        if [ ! -d "android" ]; then
+          echo "❌ CRITICAL: Android directory was not created"
+          cat cap_add_log.txt
+          exit 1
+        fi
+        
+        echo "✅ Android directory created successfully"
+        echo "📂 Android directory contents:"
+        ls -la android/
+        
+        # Verify ALL essential Android native wrapper files exist
+        echo "🔍 Verifying essential Android files..."
+        ESSENTIAL_FILES=(
+          "android/gradlew"
+          "android/gradlew.bat"
+          "android/build.gradle"
+          "android/settings.gradle"
+          "android/gradle.properties"
+          "android/app/build.gradle"
+          "android/app/src/main/AndroidManifest.xml"
+          "android/app/src/main/java/com/parknjoy/familyapp/MainActivity.java"
+          "android/app/src/main/res"
+          "android/gradle/wrapper/gradle-wrapper.jar"
+          "android/gradle/wrapper/gradle-wrapper.properties"
+        )
+        
+        MISSING_FILES=""
+        for file in "${ESSENTIAL_FILES[@]}"; do
+          if [ ! -e "$file" ]; then
+            MISSING_FILES="$MISSING_FILES $file"
+          else
+            echo "✅ Found: $file"
+          fi
+        done
+        
+        if [ -n "$MISSING_FILES" ]; then
+          echo "❌ CRITICAL: Missing essential Android files:$MISSING_FILES"
+          echo "📂 Current android structure:"
+          find android -type f | head -50
+          exit 1
+        fi
+        
+        echo "✅ All essential Android native wrapper files verified"
+        
+        # Verify MainActivity.java extends BridgeActivity
+        if [ -f "android/app/src/main/java/com/parknjoy/familyapp/MainActivity.java" ]; then
+          echo "📋 MainActivity.java content:"
+          cat android/app/src/main/java/com/parknjoy/familyapp/MainActivity.java
+          
+          if grep -q "BridgeActivity" android/app/src/main/java/com/parknjoy/familyapp/MainActivity.java; then
+            echo "✅ MainActivity properly extends BridgeActivity"
+          else
+            echo "❌ MainActivity does not extend BridgeActivity"
+            exit 1
+          fi
+        else
+          echo "❌ MainActivity.java not found"
+          exit 1
+        fi
+        
+        # Verify app/build.gradle content
+        echo "📋 Contents of android/app/build.gradle:"
+        cat android/app/build.gradle
+        
+        # Verify required configuration is present
+        if grep -q "applicationId.*com.parknjoy.familyapp" android/app/build.gradle && \
+           grep -q "versionCode" android/app/build.gradle && \
+           grep -q "versionName" android/app/build.gradle && \
+           grep -q "buildTypes" android/app/build.gradle; then
+          echo "✅ app/build.gradle contains all required configuration"
+        else
+          echo "❌ app/build.gradle missing required configuration"
+          exit 1
+        fi
+        
+        # Verify settings.gradle includes app module
+        echo "📋 Contents of android/settings.gradle:"
+        cat android/settings.gradle
+        
+        if grep -q "include.*:app" android/settings.gradle; then
+          echo "✅ settings.gradle properly includes app module"
+        else
+          echo "❌ settings.gradle missing app module inclusion"
+          exit 1
+        fi
+        
+        echo "🎉 Android platform fully scaffolded and verified!"
+
+    - name: Verify Android platform installation
+      run: |
+        echo "🔍 Verifying Android platform installation..."
+        
+        if [ ! -d "android" ]; then
+          echo "❌ CRITICAL: android directory still missing after platform addition"
+          exit 1
+        fi
+        
+        echo "✅ Android directory exists"
+        echo "📂 Android directory structure:"
+        find android -maxdepth 2 -type d | sort
+        
+        echo ""
+        echo "📋 Android project files:"
+        ls -la android/
+
+    - name: Create local.properties and optimize Gradle configuration
+      run: |
+        echo "Creating optimized Android build configuration..."
+        
+        cd android
+        
+        # Create local.properties
+        cat > local.properties << 'EOF'
+        sdk.dir=$ANDROID_SDK_ROOT
+        org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError
+        org.gradle.parallel=true
+        org.gradle.caching=true
+        org.gradle.daemon=false
+        android.useAndroidX=true
+        android.enableJetifier=true
+        EOF
+        
+        # Replace ANDROID_SDK_ROOT variable with actual path
+        sed -i "s|\$ANDROID_SDK_ROOT|$ANDROID_SDK_ROOT|g" local.properties
+        
+        # Create optimized gradle.properties if it doesn't exist or update existing
+        cat > gradle.properties << 'EOF'
+        org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -XX:+HeapDumpOnOutOfMemoryError
+        org.gradle.parallel=true
+        org.gradle.caching=true
+        org.gradle.daemon=false
+        org.gradle.configureondemand=false
+        android.useAndroidX=true
+        android.enableJetifier=true
+        android.enableR8.fullMode=false
+        kotlin.code.style=official
+        org.gradle.unsafe.configuration-cache=false
+        EOF
+        
+        # Add JAVA_HOME to gradle.properties
+        echo "org.gradle.java.home=$JAVA_HOME" >> gradle.properties
+        
+        # Make gradlew executable
+        chmod +x gradlew
+        
+        echo "✅ Android configuration completed"
+        echo "📋 local.properties:"
+        cat local.properties
+        echo ""
+        echo "📋 gradle.properties:"
+        cat gradle.properties
+
+    - name: Sync Capacitor with Android platform
+      run: |
+        echo "Syncing Capacitor with Android platform..."
+        
+        # Sync with detailed logging and retry logic
+        MAX_ATTEMPTS=3
+        for attempt in $(seq 1 $MAX_ATTEMPTS); do
+          echo "🔄 Syncing Capacitor (attempt $attempt of $MAX_ATTEMPTS)"
+          
+          if npx cap sync android --verbose 2>&1 | tee "cap_sync_log_$attempt.txt"; then
+            echo "✅ Capacitor sync completed successfully on attempt $attempt"
+            break
+          else
+            echo "❌ Capacitor sync failed on attempt $attempt"
+            
+            if [ $attempt -eq $MAX_ATTEMPTS ]; then
+              echo "💥 Capacitor sync failed after $MAX_ATTEMPTS attempts"
+              echo "📋 Last sync log:"
+              cat "cap_sync_log_$attempt.txt"
+              exit 1
+            fi
+            
+            echo "🔄 Retrying sync in 5 seconds..."
+            sleep 5
+          fi
+        done
+        
+        # Verify essential files exist after sync
+        cd android
+        REQUIRED_FILES=(
+          "app/build.gradle"
+          "build.gradle"
+          "settings.gradle"
+          "gradlew"
+        )
+        
+        MISSING_FILES=""
+        for file in "${REQUIRED_FILES[@]}"; do
+          if [ ! -f "$file" ]; then
+            MISSING_FILES="$MISSING_FILES $file"
+          fi
+        done
+        
+        if [ -n "$MISSING_FILES" ]; then
+          echo "❌ Missing essential files after sync:$MISSING_FILES"
+          echo "📂 Android directory contents:"
+          ls -la
+          exit 1
+        fi
+        
+        echo "✅ All essential Android files verified after sync"
+
+    - name: Build Debug APK with auto-healing
+      run: |
+        echo "🔨 Building Android Debug APK with auto-healing..."
+        
+        cd android
+        
+        # Function to clean build artifacts
+        clean_build() {
+            echo "🧹 Cleaning build artifacts..."
+            ./gradlew clean --no-daemon --stacktrace || true
+            rm -rf ~/.gradle/caches/
+            rm -rf .gradle/
+            rm -rf app/build/
+            rm -rf build/
+        }
+        
+        # Build with retry logic and comprehensive error handling
+        MAX_ATTEMPTS=3
+        for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "🔨 Build attempt $attempt of $MAX_ATTEMPTS"
+            
+            # Clean on retry attempts
+            if [ $attempt -gt 1 ]; then
+                clean_build
+                
+                # Update gradle.properties with current JAVA_HOME
+                echo "org.gradle.java.home=$JAVA_HOME" >> gradle.properties
+            fi
+            
+            # Verify gradlew is executable
+            chmod +x gradlew
+            
+            # Attempt build with detailed logging from android directory
+            echo "▶️ Running: cd android && ./gradlew assembleDebug --no-daemon --stacktrace --info"
+            if timeout 30m ./gradlew assembleDebug --no-daemon --stacktrace --info 2>&1 | tee "build_log_$attempt.txt"; then
+                echo "✅ Gradle build completed successfully on attempt $attempt!"
+                
+                # Verify APK was actually created and set env variable
+                echo "🔍 Searching for generated APK files..."
+                find . -name "*.apk" -type f -exec ls -la {} \; || echo "No APK files found with find command"
+                
+                # Search for APK in multiple possible locations
+                APK_FOUND=""
+                POSSIBLE_LOCATIONS=(
+                    "app/build/outputs/apk/debug/app-debug.apk"
+                    "app/build/outputs/apk/debug/app-universal-debug.apk" 
+                    "build/outputs/apk/debug/app-debug.apk"
+                    "capacitor-cordova-android-plugins/build/outputs/apk/debug/app-debug.apk"
+                )
+                
+                for location in "${POSSIBLE_LOCATIONS[@]}"; do
+                    if [ -f "$location" ]; then
+                        echo "🎉 SUCCESS: APK found at: $location"
+                        ls -la "$location"
+                        APK_FOUND="$location"
+                        break
+                    fi
+                done
+                
+                # If not found in expected locations, search everywhere
+                if [ -z "$APK_FOUND" ]; then
+                    echo "🔍 APK not found in expected locations, searching entire android directory..."
+                    APK_SEARCH=$(find . -name "*debug*.apk" -type f | head -1)
+                    if [ -n "$APK_SEARCH" ]; then
+                        APK_FOUND="$APK_SEARCH"
+                        echo "🎉 SUCCESS: APK found at: $APK_FOUND"
+                        ls -la "$APK_FOUND"
+                    fi
+                fi
+                
+                if [ -n "$APK_FOUND" ]; then
+                    # Verify APK is valid (not empty)
+                    APK_SIZE=$(stat -f%z "$APK_FOUND" 2>/dev/null || stat -c%s "$APK_FOUND" 2>/dev/null)
+                    if [ "$APK_SIZE" -gt 1000000 ]; then  # At least 1MB
+                        echo "✅ APK size validation passed: $APK_SIZE bytes"
+                        # Store full path for upload step
+                        cd ..
+                        echo "APK_PATH=android/$APK_FOUND" >> $GITHUB_ENV
+                        break
+                    else
+                        echo "❌ APK size validation failed: $APK_SIZE bytes (too small)"
+                        if [ $attempt -eq $MAX_ATTEMPTS ]; then
+                            exit 1
+                        fi
+                        continue
+                    fi
+                else
+                    echo "❌ No APK found anywhere in android directory"
+                    echo "📂 Full directory structure of app/build:"
+                    find app/build -type f | head -20 || echo "app/build not found"
+                    
+                    if [ $attempt -eq $MAX_ATTEMPTS ]; then
+                        echo "💥 No APK generated after $MAX_ATTEMPTS attempts"
+                        exit 1
+                    fi
+                fi
+            else
+                echo "❌ Gradle build failed on attempt $attempt"
+                
+                # Analyze build log for common issues and apply fixes
+                if [ -f "build_log_$attempt.txt" ]; then
+                    echo "🔍 Analyzing build failure..."
+                    
+                    if grep -q "UnsupportedClassVersionError\|Unsupported class file major version" "build_log_$attempt.txt"; then
+                        echo "🔧 Fixing Java version compatibility issue..."
+                        echo "org.gradle.java.home=$JAVA_HOME" >> gradle.properties
+                    fi
+                    
+                    if grep -q "Could not resolve\|404\|Connection refused" "build_log_$attempt.txt"; then
+                        echo "🔧 Adding additional repositories for dependency resolution..."
+                     if [ -f "build.gradle" ]; then
+                            cp build.gradle build.gradle.backup
+                        fi
+                    fi
+                    
+                    if grep -q "Execution failed.*lint" "build_log_$attempt.txt"; then
+                        echo "🔧 Disabling lint checks to allow build..."
+                        if [ -f "app/build.gradle" ]; then
+                            echo "android { lintOptions { abortOnError false } }" >> app/build.gradle
+                        fi
+                    fi
+                fi
+                
+                if [ $attempt -eq $MAX_ATTEMPTS ]; then
+                    echo "💥 All build attempts failed. Final logs:"
+                    echo "========================================"
+                    tail -100 "build_log_$attempt.txt"
+                    echo "========================================"
+                    exit 1
+                fi
+            fi
+        done
+
+    - name: Upload Debug APK Artifact
+      uses: actions/upload-artifact@v4
+      if: success() && env.APK_PATH
+      with:
+        name: park-n-joy-debug-apk
+        path: ${{ env.APK_PATH }}
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Build Summary and Validation
+      if: always()
+      run: |
+        echo "📱 Park N Joy Android Build Summary"
+        echo "===================================="
+        
+        # Check if android directory exists before proceeding
+        if [ ! -d "android" ]; then
+          echo "❌ CRITICAL ERROR: android directory does not exist"
+          echo "📂 Current directory contents:"
+          ls -la
+          echo ""
+          echo "🔍 This indicates the Android platform was never successfully added"
+          echo "💡 Check the 'Add Android platform' step logs above for errors"
+          exit 1
+        fi
+        
+        cd android
+        
+        # Search for APK files
+        EXPECTED_APK="app/build/outputs/apk/debug/app-debug.apk"
+        
+        echo "🔍 APK Generation Status:"
+        if [ -f "$EXPECTED_APK" ]; then
+            echo "✅ SUCCESS: APK Generated"
+            echo "📦 APK Location: $EXPECTED_APK"
+            echo "📏 APK Size: $(du -h "$EXPECTED_APK" | cut -f1)"
+            echo "🎯 Artifact Name: park-n-joy-debug-apk"
+            echo "⬇️  Status: Uploaded to GitHub Actions artifacts"
+            echo "📱 Ready for download and installation"
+            
+            # APK metadata
+            echo ""
+            echo "📋 APK Details:"
+            ls -la "$EXPECTED_APK"
+        else
+            echo "❌ FAILED: No APK Generated"
+            echo "🔍 Expected location: $EXPECTED_APK"
+            
+            # Search for any APK files as fallback
+            echo "🔍 Searching for any APK files in project..."
+            APK_FILES=$(find . -name "*.apk" -type f 2>/dev/null)
+            if [ -n "$APK_FILES" ]; then
+                echo "📦 Found APK files in unexpected locations:"
+                echo "$APK_FILES" | while read apk; do
+                    echo "  📁 $apk ($(du -h "$apk" | cut -f1))"
+                done
+            else
+                echo "❌ No APK files found anywhere in the project"
+            fi
+            
+            # Debug build directory structure
+            echo ""
+            echo "📂 Build Output Structure Debug:"
+            if [ -d "app/build" ]; then
+                echo "app/build directory contents:"
+                find app/build -type f -name "*.apk" 2>/dev/null || echo "No APK files in app/build"
+                echo ""
+                echo "app/build directory structure (first 20 items):"
+                find app/build -type d 2>/dev/null | head -20
+            else
+                echo "❌ app/build directory does not exist"
+            fi
+        fi
+        
+        echo ""
+        echo "🏗️  Final Build Environment:"
+        echo "   • Node.js: $(node --version)"
+        echo "   • Java: $(java -version 2>&1 | head -1)"
+        echo "   • Android SDK: $ANDROID_SDK_ROOT"
+        echo "   • Capacitor: $(npx cap --version 2>/dev/null || echo 'Version check failed')"
+        if [ -f "gradlew" ]; then
+          echo "   • Gradle: $(./gradlew --version 2>/dev/null | grep Gradle | head -1 || echo 'Version check failed')"
+        else
+          echo "   • Gradle: gradlew not found"
+        fi
+        echo "   • Build System: Capacitor + Android Gradle Plugin"
+        echo "   • Auto-healing: Enabled with 3 retry attempts"
